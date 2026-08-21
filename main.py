@@ -1,5 +1,3 @@
-%%writefile gpuagent.py
-
 import subprocess
 import sys
 import csv
@@ -40,14 +38,46 @@ def get_stats(report):
     )
 
     return result.stdout
-
+NCU_METRICS = [
+    "sm__cycles_active.avg",
+    "sm__warps_active.avg.pct_of_peak_sustained_active",
+    "launch__occupancy_limit_blocks",
+    "launch__occupancy_limit_registers",
+    "launch__occupancy_limit_shared_mem",
+    "launch__registers_per_thread",
+    "sm__inst_executed.sum",
+    "sm__inst_executed_pipe_fp32.avg.pct_of_peak_sustained_active",
+    "sm__inst_executed_pipe_tensor.avg.pct_of_peak_sustained_active",
+    "dram__bytes_read.sum",
+    "dram__bytes_write.sum",
+    "dram__throughput.avg.pct_of_peak_sustained_elapsed",
+    "dram__bytes.sum.per_second",
+    "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed",
+    "launch__shared_mem_per_block_allocated",
+    "l1tex__t_sector_hit_rate.pct",
+    "l1tex__throughput.avg.pct_of_peak_sustained_active",
+    "lts__t_sector_hit_rate.pct",
+    "lts__throughput.avg.pct_of_peak_sustained_active",
+    "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed",
+    "smsp__sass_average_data_bytes_per_sector_mem_global_op_ld.pct",
+    "smsp__warp_issue_stalled_memory_dependency_per_warp_active.pct",
+    "smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct",
+    "smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct",
+    "smsp__warp_issue_stalled_barrier_per_warp_active.pct",
+    "smsp__warp_issue_stalled_branch_resolving_per_warp_active.pct",
+    "smsp__sass_average_branch_targets_threads_uniform.pct",
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed",
+    "gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed",
+    ]
 def profile_kernel_with_ncu(workload, kernel_name):
+    
     command = [
         "ncu",
         "--csv",
-        "--set", "basic",
+        "--page", "raw",
         "--kernel-name", kernel_name,
         "--launch-count", "1",
+        "--metrics", ",".join(NCU_METRICS),
     ] + workload
 
     print(f"\nDeep profiling kernel: {kernel_name}")
@@ -63,47 +93,87 @@ def profile_kernel_with_ncu(workload, kernel_name):
 
 
 def parse_ncu_output(output):
-    metrics = {}
-
     lines = output.splitlines()
 
-    # Find the actual NCU CSV header
-    for i, line in enumerate(lines):
-        if '"Metric Name"' in line and '"Metric Value"' in line:
-            csv_text = "\n".join(lines[i:])
-            break
-    else:
-        return metrics
+    # Find NCU's actual CSV header.
+    # Raw-page output begins with columns such as:
+    # ID, Process ID, Process Name, ..., Kernel Name, ...
+    header_index = None
 
+    for i, line in enumerate(lines):
+        if line.startswith('"ID",') or line.startswith("ID,"):
+            header_index = i
+            break
+
+    if header_index is None:
+        return {}
+
+    csv_text = "\n".join(lines[header_index:])
     reader = csv.DictReader(io.StringIO(csv_text))
 
-    for row in reader:
-        name = row.get("Metric Name")
-        value = row.get("Metric Value")
+    rows = list(reader)
 
-        if not name or not value:
+    if not rows:
+        return {}
+
+    # We currently profile one kernel launch, so use its row.
+    row = rows[-1]
+
+    metrics = {}
+
+    for name in NCU_METRICS:
+        value = row.get(name)
+
+        if value is None or value == "":
             continue
 
-        value = value.replace(",", "")
+        value = value.replace(",", "").replace("%", "")
 
         try:
-            value = float(value)
+            metrics[name] = float(value)
         except ValueError:
             continue
 
-        metrics[name] = value
+    return metrics
+
+
+
+def analyze_roofline(metrics):
+    compute_sol = metrics.get(
+      "sm__throughput.avg.pct_of_peak_sustained_elapsed"
+    )
+
+    memory_sol = metrics.get(
+      "gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed"
+    )
+
+    if compute_sol is None or memory_sol is None:
+      return {
+        "classification": "unknown",
+        "compute_sol": compute_sol,
+        "memory_sol": memory_sol,
+        "efficiency": None,
+        "at_roofline": False,
+        "headroom": None,
+      }
+
+    if compute_sol < 60 and memory_sol < 60:
+        classification = "underutilized"
+    elif memory_sol >= compute_sol:
+        classification = "memory_bound"
+    else:
+        classification = "compute_bound"
+
+    efficiency = max(compute_sol, memory_sol)
 
     return {
-    "duration_ns": metrics.get("Duration"),
-    "compute_throughput": metrics.get("Compute (SM) Throughput"),
-    "memory_throughput": metrics.get("Memory Throughput"),
-    "dram_throughput": metrics.get("DRAM Throughput"),
-    "registers_per_thread": metrics.get("Registers Per Thread"),
-    "waves_per_sm": metrics.get("Waves Per SM"),
-    "theoretical_occupancy": metrics.get("Theoretical Occupancy"),
-    "achieved_occupancy": metrics.get("Achieved Occupancy"),
+        "classification": classification,
+        "compute_sol": compute_sol,
+        "memory_sol": memory_sol,
+        "efficiency": efficiency,
+        "at_roofline": efficiency >= 95,
+        "headroom": max(0, 100 - efficiency),
     }
-
 
 
 def parse_kernel_stats(stats):
@@ -462,6 +532,84 @@ def diagnose_profile(profile_data):
     return findings
 
 
+def diagnose_kernel(kernel, ncu_metrics):
+    """
+    Combine NSYS kernel-level importance with NCU hardware metrics.
+
+    This is intentionally a small V1 heuristic layer. Later, these
+    structured facts will be passed to the AI reasoning layer instead
+    of growing into a large set of hard-coded rules.
+    """
+    diagnosis = {
+        "kernel": kernel["name"],
+        "kernel_time_percent": kernel["time_percent"],
+        "priority": "investigate",
+        "evidence": [],
+        "reason": "",
+    }
+
+    compute = ncu_metrics.get("compute_throughput")
+    memory = ncu_metrics.get("memory_throughput")
+    dram = ncu_metrics.get("dram_throughput")
+    achieved_occupancy = ncu_metrics.get("achieved_occupancy")
+    theoretical_occupancy = ncu_metrics.get("theoretical_occupancy")
+    registers = ncu_metrics.get("registers_per_thread")
+
+    diagnosis["evidence"].append(
+        f"{kernel['name']} accounts for {kernel['time_percent']:.1f}% of GPU kernel time"
+    )
+
+    if compute is not None:
+        diagnosis["evidence"].append(
+            f"Compute (SM) throughput is {compute:.2f}%"
+        )
+
+    if memory is not None:
+        diagnosis["evidence"].append(
+            f"Memory throughput is {memory:.2f}%"
+        )
+
+    if dram is not None:
+        diagnosis["evidence"].append(
+            f"DRAM throughput is {dram:.2f}%"
+        )
+
+    if achieved_occupancy is not None:
+        diagnosis["evidence"].append(
+            f"Achieved occupancy is {achieved_occupancy:.2f}%"
+        )
+
+    if theoretical_occupancy is not None:
+        diagnosis["evidence"].append(
+            f"Theoretical occupancy is {theoretical_occupancy:.2f}%"
+        )
+
+    if registers is not None:
+        diagnosis["evidence"].append(
+            f"Registers per thread is {registers:.0f}"
+        )
+
+    # V1 judgment:
+    # If a dominant kernel is already driving compute very hard,
+    # low occupancy alone is not enough evidence that rewriting it
+    # should be the first optimization target.
+    if compute is not None and compute >= 90:
+        diagnosis["priority"] = "low"
+        diagnosis["reason"] = (
+            "The kernel dominates runtime, but it is already using most of the "
+            "GPU's available compute throughput. Low occupancy by itself does "
+            "not prove the kernel is inefficient, so rewriting this kernel "
+            "should not be the first optimization target."
+        )
+    else:
+        diagnosis["reason"] = (
+            "The kernel is important to overall runtime and NCU does not show "
+            "near-saturated compute throughput, so it remains worth deeper investigation."
+        )
+
+    return diagnosis
+
+
 
 if __name__ == "__main__":
 
@@ -501,7 +649,7 @@ if __name__ == "__main__":
 
     analyze_profile(profile_data)
     findings = diagnose_profile(profile_data)
-    
+
 
     print("\n================ DIAGNOSTIC FINDINGS ================")
 
@@ -513,14 +661,48 @@ if __name__ == "__main__":
 
 
 
-  
-    ncu_output = profile_kernel_with_ncu(
-    sys.argv[1:],
-    kernels[0]["name"]
-    )
 
-    ncu_metrics = parse_ncu_output(ncu_output)
-    print(ncu_metrics)
+    if kernels:
+        top_kernel = kernels[0]
+
+        ncu_output = profile_kernel_with_ncu(
+            sys.argv[1:],
+            top_kernel["name"]
+        )
+
+        print("\n================ RAW NCU OUTPUT ================")
+        print(ncu_output[:10000])
+
+        ncu_metrics = parse_ncu_output(ncu_output)
+
+        print("\n================ NCU KERNEL METRICS ================")
+        for name, value in ncu_metrics.items():
+            print(f"{name}: {value}")
+
+        
+        roofline = analyze_roofline(ncu_metrics)
+
+        print("\n================ ROOFLINE ANALYSIS ================")
+        print(f"Classification: {roofline['classification']}")
+        print(f"Compute SOL: {roofline['compute_sol']}%")
+        print(f"Memory SOL: {roofline['memory_sol']}%")
+        print(f"Efficiency: {roofline['efficiency']}%")
+        print(f"At Roofline: {roofline['at_roofline']}")
+        print(f"Headroom: {roofline['headroom']}%")
+
+        kernel_diagnosis = diagnose_kernel(top_kernel, ncu_metrics)
+
+        print("\n================ KERNEL DIAGNOSIS ================")
+        print(f"Kernel: {kernel_diagnosis['kernel']}")
+        print(f"Priority: {kernel_diagnosis['priority'].upper()}")
+
+        print("\nEvidence:")
+        for evidence in kernel_diagnosis["evidence"]:
+            print(f"  - {evidence}")
+
+        print(f"\nReason: {kernel_diagnosis['reason']}")
+    else:
+        print("\nNo GPU kernels were found, so NCU deep profiling was skipped.")
 
 
 
