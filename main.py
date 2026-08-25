@@ -2,6 +2,12 @@ import subprocess
 import sys
 import csv
 import io
+import json
+import os
+from google import genai
+import torch
+import triton
+import importlib.util
 
 
 def profile(workload):
@@ -70,7 +76,7 @@ NCU_METRICS = [
     "gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed",
     ]
 def profile_kernel_with_ncu(workload, kernel_name):
-    
+
     command = [
         "ncu",
         "--csv",
@@ -611,7 +617,527 @@ def diagnose_kernel(kernel, ncu_metrics):
 
 
 
+
+BOTTLENECK_PROMPT = """\
+You are a GPU performance expert analyzing GPU kernel profiling data.
+
+## Task
+Analyze the NCU metrics and identify the primary performance bottleneck.
+
+Classify it as:
+- memory: Memory bandwidth is the limiting factor
+- compute: Compute throughput is the limiting factor
+- underutilized: Neither is saturated (<60% both), indicating possible stalls,
+  occupancy limitations, instruction dependencies, launch configuration issues,
+  or insufficient parallelism.
+
+## GPU Specifications
+{gpu_specs}
+
+## Roofline Analysis
+- Bottleneck: {roofline_bottleneck}
+- Compute SOL: {compute_sol:.1f}%
+- Memory SOL: {memory_sol:.1f}%
+- Efficiency: {efficiency:.1f}%
+- Headroom: {headroom:.1f}%
+- At Roofline: {at_roofline}
+
+## NCU Metrics
+{ncu_metrics}
+
+## Output
+Return JSON only.
+
+Requirements:
+- Ground every conclusion in the provided metrics.
+- NEVER invent metric names or values.
+- Do not assume low occupancy alone indicates poor performance.
+- Do not recommend increasing occupancy unless evidence shows occupancy is limiting performance.
+- Consider whether the kernel is already near its hardware limit.
+- Prioritize fixes most likely to improve measured performance.
+"""
+
+
+def analyze_with_llm(kernel_name, ncu_metrics, roofline):
+    client = genai.Client(
+        api_key=os.environ["GEMINI_API_KEY"]
+    )
+
+    prompt = BOTTLENECK_PROMPT.format(
+        gpu_specs=json.dumps(gpu_specs, indent=2),
+        roofline_bottleneck=roofline["classification"],
+        compute_sol=roofline["compute_sol"],
+        memory_sol=roofline["memory_sol"],
+        efficiency=roofline["efficiency"],
+        headroom=roofline["headroom"],
+        at_roofline=roofline["at_roofline"],
+        ncu_metrics=json.dumps(ncu_metrics, indent=2),
+    )
+
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+    )
+
+    return response.text
+
+
+
+def get_gpu_specs():
+  props = torch.cuda.get_device_properties(0)
+
+  return {
+        "name": props.name,
+        "compute_capability": f"{props.major}.{props.minor}",
+        "sm_count": props.multi_processor_count,
+        "total_memory_gb": round(props.total_memory / (1024 ** 3), 2),
+        "max_threads_per_block": props.max_threads_per_block,
+        "warp_size": props.warp_size,
+    }
+
+
+
+TRITON_GENERATION_PROMPT = """\
+You are an expert GPU performance engineer specializing in PyTorch and Triton.
+
+Your task is to replace the provided PyTorch computation with an optimized
+Triton implementation.
+
+## Target GPU
+
+{gpu_specs}
+
+## PyTorch Reference
+
+{pytorch_code}
+
+## Requirements
+
+- Preserve the exact computation performed by the PyTorch reference.
+- Generate a Triton implementation optimized for the target GPU.
+- Include all required imports.
+- Include the @triton.jit kernel.
+- Include a Python wrapper named `triton_implementation`.
+- `triton_implementation` must preserve the same input/output interface as the PyTorch reference.
+- Do not use torch operations to perform the computation inside the replacement.
+- Return Python code only.
+- Use minimal comments.
+- Do not include explanations, tests, or benchmarks.
+"""
+
+
+def generate_triton_kernel(pytorch_code, gpu_specs):
+    client = genai.Client(
+        api_key=os.environ["GEMINI_API_KEY"]
+    )
+
+    prompt = TRITON_GENERATION_PROMPT.format(
+        pytorch_code=pytorch_code,
+        gpu_specs=json.dumps(gpu_specs, indent=2),
+    )
+
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+    )
+
+    return response.text
+
+
+
+
+def extract_python_code(response):
+    response = response.strip()
+
+    if response.startswith("```python"):
+        response = response[len("```python"):]
+
+    if response.startswith("```"):
+        response = response[3:]
+
+    if response.endswith("```"):
+        response = response[:-3]
+
+    return response.strip()
+
+
+
+def verify_candidate(filename="generated_kernel.py"):
+    import importlib.util
+
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "candidate_kernel",
+            filename
+        )
+
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        test_shapes = [
+            (1024,),
+            (4096,),
+            (256, 256),
+            (12345,),
+        ]
+
+        for shape in test_shapes:
+            x = torch.randn(shape, device="cuda")
+
+            expected = torch.relu(x)
+            actual = module.triton_implementation(x)
+
+            try:
+                torch.testing.assert_close(
+                    actual,
+                    expected,
+                    rtol=1e-4,
+                    atol=1e-4,
+                )
+
+            except AssertionError as e:
+                return {
+                    "passed": False,
+                    "error_type": "correctness",
+                    "shape": shape,
+                    "error": str(e),
+                }
+
+        return {
+            "passed": True,
+            "tests": len(test_shapes),
+        }
+
+    except Exception as e:
+        return {
+            "passed": False,
+            "error_type": "execution",
+            "error": str(e),
+        }
+
+
+
+def benchmark_candidate():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "generated_kernel",
+        "generated_kernel.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    x = torch.randn(10_000_000, device="cuda")
+
+    # Warmup
+    for _ in range(10):
+        torch.relu(x)
+        module.triton_implementation(x)
+
+    torch.cuda.synchronize()
+
+    # PyTorch
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+
+    start.record()
+
+    for _ in range(100):
+        torch.relu(x)
+
+    end.record()
+    torch.cuda.synchronize()
+
+    pytorch_ms = start.elapsed_time(end) / 100
+
+    # Triton
+    start.record()
+
+    for _ in range(100):
+        module.triton_implementation(x)
+
+    end.record()
+    torch.cuda.synchronize()
+
+    triton_ms = start.elapsed_time(end) / 100
+
+    return {
+        "pytorch_ms": pytorch_ms,
+        "triton_ms": triton_ms,
+        "speedup": pytorch_ms / triton_ms,
+    }
+
+
+
+def create_candidate_workload():
+    code = """
+import torch
+from generated_kernel import triton_implementation
+
+x = torch.randn(10_000_000, device="cuda")
+
+# Compile / warmup
+for _ in range(5):
+    y = triton_implementation(x)
+
+torch.cuda.synchronize()
+
+# Profiling run
+y = triton_implementation(x)
+torch.cuda.synchronize()
+"""
+
+    with open("candidate_workload.py", "w") as f:
+        f.write(code)
+
+
+def profile_candidate():
+    workload = ["python", "candidate_workload.py"]
+
+    # Run generated Triton workload under NSYS
+    profile(workload)
+
+    # Get and parse kernel stats
+    kernel_stats = get_stats("cuda_gpu_kern_sum")
+    kernels = parse_kernel_stats(kernel_stats)
+
+    if not kernels:
+        print("No candidate GPU kernels found.")
+        return None
+
+    print("\n================ CANDIDATE KERNELS ================")
+
+    for kernel in kernels:
+      total_ms = kernel["total_time_ns"] / 1_000_000
+
+      print(
+          f"{kernel['name']} | "
+          f"{total_ms:.4f} ms | "
+          f"{kernel['instances']} launches"
+    )
+
+    # For our candidate workload, the dominant kernel should be
+    # the generated Triton kernel.
+    top_kernel = kernels[0]
+
+    print(f"\nProfiling generated kernel with NCU: {top_kernel['name']}")
+
+    ncu_output = profile_kernel_with_ncu(
+        workload,
+        top_kernel["name"],
+    )
+
+    ncu_metrics = parse_ncu_output(ncu_output)
+
+    return {
+        "kernel": top_kernel,
+        "metrics": ncu_metrics,
+    }
+
+
+
+TRITON_OPTIMIZATION_PROMPT = """\
+You are an expert GPU performance engineer specializing in Triton.
+
+## PyTorch Reference
+{pytorch_code}
+
+## Current Triton Implementation
+{triton_code}
+
+## Target GPU
+{gpu_specs}
+
+## Benchmark
+PyTorch: {pytorch_ms:.4f} ms
+Triton: {triton_ms:.4f} ms
+Speedup: {speedup:.2f}x
+
+## Roofline
+Classification: {classification}
+Compute SOL: {compute_sol:.2f}%
+Memory SOL: {memory_sol:.2f}%
+Efficiency: {efficiency:.2f}%
+Headroom: {headroom:.2f}%
+
+## NCU Metrics
+{ncu_metrics}
+
+## Previous Failure
+{error}
+
+## Task
+Generate an improved, valid Triton implementation.
+
+If a previous compiler/runtime error is provided, fix that error before
+attempting further optimization.
+
+Requirements:
+- Preserve correctness.
+- Use only valid Triton APIs.
+- Wrapper MUST be named `triton_implementation`.
+- Preserve the same input/output interface.
+- Return Python code only.
+- Use minimal comments.
+"""
+
+
+def optimize_triton_kernel(pytorch_code, triton_code, gpu_specs, benchmark, ncu_metrics, roofline,error=None):
+    client = genai.Client(
+        api_key=os.environ["GEMINI_API_KEY"]
+    )
+
+    prompt = TRITON_OPTIMIZATION_PROMPT.format(
+        gpu_specs=json.dumps(gpu_specs, indent=2),
+        pytorch_code=pytorch_code,
+        triton_code=triton_code,
+        pytorch_ms=benchmark["pytorch_ms"],
+        triton_ms=benchmark["triton_ms"],
+        speedup=benchmark["speedup"],
+        classification=roofline["classification"],
+        compute_sol=roofline["compute_sol"],
+        memory_sol=roofline["memory_sol"],
+        efficiency=roofline["efficiency"],
+        headroom=roofline["headroom"],
+        ncu_metrics=json.dumps(ncu_metrics, indent=2),
+        error=error or "None",
+    )
+
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+    )
+
+    return extract_python_code(response.text)
+
+
 if __name__ == "__main__":
+
+
+ # ==========================================
+    # TEST TRITON GENERATION
+    # ==========================================
+
+    gpu_specs = get_gpu_specs()
+
+    pytorch_code = """
+    def pytorch_reference(x):
+        return torch.relu(x)
+    """
+
+    triton_code = generate_triton_kernel(
+        pytorch_code,
+        gpu_specs,
+    )
+
+    triton_code = extract_python_code(triton_code)
+
+    with open("generated_kernel.py", "w") as f:
+        f.write(triton_code)
+
+    print("\n================ GENERATED TRITON ================")
+    print(triton_code)
+
+    print("\nGenerated candidate saved to generated_kernel.py")
+
+
+    verification = verify_candidate()
+
+    print("\n================ VERIFICATION ================")
+
+    if verification["passed"]:
+        print(f"PASS: {verification['tests']} tests passed")
+    else:
+        print("FAIL")
+        print(f"Shape: {verification['shape']}")
+        print(verification["error"])
+
+    
+    if verification["passed"]:
+      benchmark = benchmark_candidate()
+
+      print("\n================ BENCHMARK ================")
+      print(f"PyTorch: {benchmark['pytorch_ms']:.4f} ms")
+      print(f"Triton:  {benchmark['triton_ms']:.4f} ms")
+      print(f"Speedup: {benchmark['speedup']:.2f}x")
+
+    create_candidate_workload()
+
+    candidate_profile = profile_candidate()
+
+    if candidate_profile:
+        candidate_metrics = candidate_profile["metrics"]
+
+        print("\n================ CANDIDATE NCU METRICS ================")
+
+        for name, value in candidate_metrics.items():
+            print(f"{name}: {value}")
+
+        candidate_roofline = analyze_roofline(candidate_metrics)
+
+        print("\n================ CANDIDATE ROOFLINE ================")
+        print(f"Classification: {candidate_roofline['classification']}")
+        print(f"Compute SOL: {candidate_roofline['compute_sol']}%")
+        print(f"Memory SOL: {candidate_roofline['memory_sol']}%")
+        print(f"Efficiency: {candidate_roofline['efficiency']}%")
+        print(f"Headroom: {candidate_roofline['headroom']}%")
+
+
+        optimized_code = optimize_triton_kernel(
+        pytorch_code=pytorch_code,
+        triton_code=triton_code,
+        gpu_specs=gpu_specs,
+        benchmark=benchmark,
+        ncu_metrics=candidate_metrics,
+        roofline=candidate_roofline,
+        )
+
+    print("\n================ OPTIMIZED TRITON V2 ================")
+    print(optimized_code)
+
+    with open("generated_kernel_v2.py", "w") as f:
+        f.write(optimized_code)
+
+    print("\nOptimized candidate saved to generated_kernel_v2.py")
+
+    v2_verification = verify_candidate("generated_kernel_v2.py")
+
+    print("\n================ V2 VERIFICATION ================")
+
+    if v2_verification["passed"]:
+        print(f"PASS: {v2_verification['tests']} tests passed")
+    else:
+        print("FAIL")
+        print(f"Type: {v2_verification['error_type']}")
+        print(v2_verification["error"])
+
+        optimized_code = optimize_triton_kernel(
+            pytorch_code=pytorch_code,
+            triton_code=optimized_code,
+            gpu_specs=gpu_specs,
+            benchmark=benchmark,
+            ncu_metrics=candidate_metrics,
+            roofline=candidate_roofline,
+            error=v2_verification["error"],
+        )
+
+        with open("generated_kernel_v2.py", "w") as f:
+            f.write(optimized_code)
+
+        v2_verification = verify_candidate("generated_kernel_v2.py")
+
+        print("\n================ V2 RETRY VERIFICATION ================")
+
+        if v2_verification["passed"]:
+            print(f"PASS: {v2_verification['tests']} tests passed")
+        else:
+            print("FAIL")
+            print(v2_verification["error"])
+
+    sys.exit(0)
+
+
+
 
     if len(sys.argv) < 2:
         print("Usage: python gpuagent.py <workload>")
@@ -679,8 +1205,22 @@ if __name__ == "__main__":
         for name, value in ncu_metrics.items():
             print(f"{name}: {value}")
 
-        
+
         roofline = analyze_roofline(ncu_metrics)
+
+
+        gpu_specs = get_gpu_specs()
+
+        print("\n================ GPU SPECS ================")
+        for name, value in gpu_specs.items():
+            print(f"{name}: {value}")
+
+        llm_diagnosis = analyze_with_llm(top_kernel["name"], ncu_metrics, roofline)
+
+        print("\n================ LLM DIAGNOSIS ================")
+        print(llm_diagnosis)
+
+
 
         print("\n================ ROOFLINE ANALYSIS ================")
         print(f"Classification: {roofline['classification']}")
