@@ -1,0 +1,38 @@
+import os
+import json
+from openai import OpenAI
+
+from gpu_agent.prompts import TRITON_GENERATION_PROMPT
+
+client = OpenAI()
+
+def generate_triton_kernel(pytorch_code, gpu_specs):
+
+    prompt = TRITON_GENERATION_PROMPT.format(
+        pytorch_code=pytorch_code,
+        gpu_specs=json.dumps(gpu_specs, indent=2),
+    )
+
+    response = client.responses.create(
+        model="gpt-5.6-terra",
+        input=prompt,
+    )
+
+    return response.output_text
+
+
+
+
+def extract_python_code(response):
+    response = response.strip()
+
+    if response.startswith("```python"):
+        response = response[len("```python"):]
+
+    if response.startswith("```"):
+        response = response[3:]
+
+    if response.endswith("```"):
+        response = response[:-3]
+
+    return response.strip()
