@@ -4,6 +4,7 @@ from openai import OpenAI
 
 from gpu_agent.prompts import TRITON_GENERATION_PROMPT
 
+client = OpenAI()
 
 def generate_triton_kernel(pytorch_code, gpu_specs):
 

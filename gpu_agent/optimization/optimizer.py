@@ -5,6 +5,8 @@ from openai import OpenAI
 from gpu_agent.prompts import TRITON_OPTIMIZATION_PROMPT
 from gpu_agent.generation.generator import extract_python_code
 
+client = OpenAI()
+
 def optimize_triton_kernel(pytorch_code, triton_code, gpu_specs, benchmark, ncu_metrics, roofline,error=None):
 
     prompt = TRITON_OPTIMIZATION_PROMPT.format(

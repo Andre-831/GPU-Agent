@@ -5,6 +5,8 @@ from openai import OpenAI
 from gpu_agent.prompts import BOTTLENECK_PROMPT
 
 
+client = OpenAI()
+
 def analyze_profile(profile_data):
     print("\n================ GPU PERFORMANCE ANALYSIS ================")
 
@@ -251,9 +253,9 @@ def analyze_with_llm(kernel_name, ncu_metrics, roofline):
         ncu_metrics=json.dumps(ncu_metrics, indent=2),
     )
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
+    response = client.responses.create(
+        model="gpt-5.6-terra",
+        input=prompt,
     )
 
-    return response.text
+    return response.output_text
