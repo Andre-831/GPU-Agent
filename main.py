@@ -8,7 +8,9 @@ from google import genai
 import torch
 import triton
 import importlib.util
+from openai import OpenAI
 
+client = OpenAI()
 
 def profile(workload):
     command = [
@@ -727,21 +729,18 @@ Triton implementation.
 
 
 def generate_triton_kernel(pytorch_code, gpu_specs):
-    client = genai.Client(
-        api_key=os.environ["GEMINI_API_KEY"]
-    )
 
     prompt = TRITON_GENERATION_PROMPT.format(
         pytorch_code=pytorch_code,
         gpu_specs=json.dumps(gpu_specs, indent=2),
     )
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
+    response = client.responses.create(
+        model="gpt-5.6-terra",
+        input=prompt,
     )
 
-    return response.text
+    return response.output_text
 
 
 
@@ -817,13 +816,14 @@ def verify_candidate(filename="generated_kernel.py"):
 
 
 
-def benchmark_candidate():
+def benchmark_candidate(filename="generated_kernel.py"):
     import importlib.util
 
     spec = importlib.util.spec_from_file_location(
-        "generated_kernel",
-        "generated_kernel.py"
+        "candidate_kernel",
+        filename
     )
+
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
 
@@ -836,10 +836,10 @@ def benchmark_candidate():
 
     torch.cuda.synchronize()
 
-    # PyTorch
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
 
+    # PyTorch
     start.record()
 
     for _ in range(100):
@@ -983,9 +983,6 @@ Requirements:
 
 
 def optimize_triton_kernel(pytorch_code, triton_code, gpu_specs, benchmark, ncu_metrics, roofline,error=None):
-    client = genai.Client(
-        api_key=os.environ["GEMINI_API_KEY"]
-    )
 
     prompt = TRITON_OPTIMIZATION_PROMPT.format(
         gpu_specs=json.dumps(gpu_specs, indent=2),
@@ -1003,12 +1000,12 @@ def optimize_triton_kernel(pytorch_code, triton_code, gpu_specs, benchmark, ncu_
         error=error or "None",
     )
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
+    response = client.responses.create(
+        model="gpt-5.6-terra",
+        input=prompt,
     )
 
-    return extract_python_code(response.text)
+    return extract_python_code(response.output_text)
 
 
 if __name__ == "__main__":
@@ -1049,10 +1046,14 @@ if __name__ == "__main__":
         print(f"PASS: {verification['tests']} tests passed")
     else:
         print("FAIL")
-        print(f"Shape: {verification['shape']}")
+        print(f"Type: {verification['error_type']}")
+
+        if "shape" in verification:
+            print(f"Shape: {verification['shape']}")
+
         print(verification["error"])
 
-    
+
     if verification["passed"]:
       benchmark = benchmark_candidate()
 
@@ -1106,6 +1107,7 @@ if __name__ == "__main__":
 
     if v2_verification["passed"]:
         print(f"PASS: {v2_verification['tests']} tests passed")
+
     else:
         print("FAIL")
         print(f"Type: {v2_verification['error_type']}")
@@ -1134,7 +1136,26 @@ if __name__ == "__main__":
             print("FAIL")
             print(v2_verification["error"])
 
+
+    
+    if v2_verification["passed"]:
+        v2_benchmark = benchmark_candidate("generated_kernel_v2.py")
+
+        print("\n================ V2 BENCHMARK ================")
+        print(f"PyTorch:   {v2_benchmark['pytorch_ms']:.4f} ms")
+        print(f"Triton V1: {benchmark['triton_ms']:.4f} ms")
+        print(f"Triton V2: {v2_benchmark['triton_ms']:.4f} ms")
+        print(f"V2 speedup vs PyTorch: {v2_benchmark['speedup']:.2f}x")
+
+        if v2_benchmark["triton_ms"] < benchmark["triton_ms"]:
+            print("\nV2 ACCEPTED: faster than V1")
+        else:
+            print("\nV2 REJECTED: V1 remains faster")
+
+
+
     sys.exit(0)
+
 
 
 
