@@ -15,7 +15,7 @@ from gpu_agent.optimization.optimizer import optimize_triton_kernel
 
 
 
-def run_optimization(pytorch_code):
+def run_optimization(pytorch_code, problem_file=None):
     gpu_specs = get_gpu_specs()
 
 
@@ -35,7 +35,7 @@ def run_optimization(pytorch_code):
     print("\nGenerated candidate saved to generated_kernel.py")
 
 
-    verification = verify_candidate()
+    verification = verify_candidate( problem_file=problem_file)
 
     print("\n================ VERIFICATION ================")
 
@@ -52,7 +52,7 @@ def run_optimization(pytorch_code):
         return
 
 
-    benchmark = benchmark_candidate()
+    benchmark = benchmark_candidate(problem_file=problem_file)
 
     print("\n================ BENCHMARK ================")
     print(f"PyTorch: {benchmark['pytorch_ms']:.4f} ms")
@@ -80,7 +80,7 @@ def run_optimization(pytorch_code):
             f.write(best_code)
 
         # Profile current best
-        create_candidate_workload()
+        create_candidate_workload(problem_file=problem_file)
         candidate_profile = profile_candidate()
 
         if not candidate_profile:
@@ -125,7 +125,7 @@ def run_optimization(pytorch_code):
         )
         print(candidate_code)
 
-        verification = verify_candidate(candidate_file)
+        verification = verify_candidate(candidate_file,problem_file=problem_file)
 
         print(
             f"\n================ V{iteration} VERIFICATION ================"
@@ -153,7 +153,7 @@ def run_optimization(pytorch_code):
             with open(candidate_file, "w") as f:
                 f.write(candidate_code)
 
-            verification = verify_candidate(candidate_file)
+            verification = verify_candidate(candidate_file, problem_file=problem_file)
 
             print(
                 f"\n================ V{iteration} RETRY VERIFICATION ================"
@@ -167,7 +167,7 @@ def run_optimization(pytorch_code):
 
         print(f"PASS: {verification['tests']} tests passed")
 
-        candidate_benchmark = benchmark_candidate(candidate_file)
+        candidate_benchmark = benchmark_candidate(candidate_file, problem_file=problem_file)
 
         print(
             f"\n================ V{iteration} BENCHMARK ================"

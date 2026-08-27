@@ -1,16 +1,70 @@
 import importlib.util
+import json
+import subprocess
+
 import torch
 
 
-def verify_candidate(filename="generated_kernel.py"):
-    try:
-        spec = importlib.util.spec_from_file_location(
-            "candidate_kernel",
-            filename
+def load_module(filename, module_name):
+    spec = importlib.util.spec_from_file_location(
+        module_name,
+        filename,
+    )
+
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    return module
+
+
+def verify_candidate(
+    filename="generated_kernel.py",
+    problem_file=None,
+):
+
+
+    if problem_file is not None:
+        result = subprocess.run(
+            [
+                "python",
+                "-m",
+                "gpu_agent.generation.verify_worker",
+                filename,
+                problem_file,
+            ],
+            capture_output=True,
+            text=True,
         )
 
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        if result.returncode != 0:
+            return {
+                "passed": False,
+                "error_type": "execution",
+                "error": result.stderr,
+            }
+
+        try:
+            return json.loads(result.stdout.strip())
+
+        except json.JSONDecodeError:
+            return {
+                "passed": False,
+                "error_type": "execution",
+                "error": (
+                    "Could not parse verification worker output:\n"
+                    + result.stdout
+                ),
+            }
+
+    # OLD RELU VERIFICATION
+    # Keep this so the original standalone test still works.
+
+
+    try:
+        candidate = load_module(
+            filename,
+            "candidate_kernel",
+        )
 
         test_shapes = [
             (1024,),
@@ -20,10 +74,13 @@ def verify_candidate(filename="generated_kernel.py"):
         ]
 
         for shape in test_shapes:
-            x = torch.randn(shape, device="cuda")
+            x = torch.randn(
+                shape,
+                device="cuda",
+            )
 
             expected = torch.relu(x)
-            actual = module.triton_implementation(x)
+            actual = candidate.triton_implementation(x)
 
             try:
                 torch.testing.assert_close(

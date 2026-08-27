@@ -359,28 +359,58 @@ def parse_nvtx_kernel_stats(stats):
 
     return nvtx_kernels
 
-
-
-def create_candidate_workload():
-    code = """
+def create_candidate_workload(problem_file=None):
+    if problem_file is None:
+        code = """
 import torch
 from generated_kernel import triton_implementation
 
 x = torch.randn(10_000_000, device="cuda")
 
-# Compile / warmup
 for _ in range(5):
     y = triton_implementation(x)
 
 torch.cuda.synchronize()
 
-# Profiling run
 y = triton_implementation(x)
+torch.cuda.synchronize()
+"""
+
+    else:
+        code = f"""
+import importlib.util
+import torch
+
+from generated_kernel import triton_implementation
+
+spec = importlib.util.spec_from_file_location(
+    "kernelbench_problem",
+    {problem_file!r},
+)
+
+problem = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(problem)
+
+inputs = problem.get_inputs()
+
+inputs = [
+    x.cuda() if isinstance(x, torch.Tensor) else x
+    for x in inputs
+]
+
+for _ in range(5):
+    y = triton_implementation(*inputs)
+
+torch.cuda.synchronize()
+
+y = triton_implementation(*inputs)
 torch.cuda.synchronize()
 """
 
     with open("candidate_workload.py", "w") as f:
         f.write(code)
+
+
 
 
 
