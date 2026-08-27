@@ -12,6 +12,7 @@ from gpu_agent.optimization.profiler import (
 )
 from gpu_agent.optimization.roofline import analyze_roofline
 from gpu_agent.optimization.optimizer import optimize_triton_kernel
+from gpu_agent.evaluation.evaluator import evaluate_kernel
 
 
 
@@ -202,8 +203,60 @@ def run_optimization(pytorch_code, problem_file=None):
     print(f"Speedup: {best_benchmark['speedup']:.2f}x")
     print("Best kernel saved to generated_kernel_best.py")
 
+    # FINAL EVALUATION
+
+    if problem_file is not None:
+
+        print("\n================ FINAL EVALUATION ================")
+
+        final_evaluation = evaluate_kernel(
+            filename="generated_kernel_best.py",
+            problem_file=problem_file,
+        )
+
+        if final_evaluation["correct"]:
+
+            print(
+                f"Correctness: PASS "
+                f"({final_evaluation['correctness_tests']} trials)"
+            )
+
+            print(
+                f"PyTorch: {final_evaluation['pytorch_ms']:.4f} ms"
+            )
+
+            print(
+                f"Triton:  {final_evaluation['triton_ms']:.4f} ms"
+            )
+
+            print(
+                f"Final speedup: "
+                f"{final_evaluation['speedup']:.2f}x"
+            )
+
+        else:
+
+            print("FINAL EVALUATION FAILED")
+
+            print(
+                f"Type: "
+                f"{final_evaluation.get('error_type', 'unknown')}"
+            )
+
+            print(
+                final_evaluation.get(
+                    "error",
+                    "Unknown evaluation error",
+                )
+            )
+
+    else:
+        final_evaluation = None
+
+
     return {
         "winner": f"v{best_version}",
         "code": best_code,
         "benchmark": best_benchmark,
+        "evaluation": final_evaluation,
     }
