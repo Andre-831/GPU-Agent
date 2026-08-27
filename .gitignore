@@ -3,3 +3,9 @@
 __pycache__/
 *.py[cod]
 .venv/
+
+# GPU-Agent generated files
+candidate_workload.py
+generated_kernel*.py
+gpuagent_profile.nsys-rep
+gpuagent_profile.sqlite
