@@ -17,6 +17,36 @@ def load_module(filename, module_name):
     return module
 
 
+def set_seed(seed):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def tensors_allclose(actual, expected, rtol=1e-4, atol=1e-4):
+    actual_flat = actual.reshape(-1)
+    expected_flat = expected.reshape(-1)
+
+    # Compare in chunks to avoid large temporary GPU allocations
+    # from torch.allclose on very large tensors.
+    chunk_size = 10_000_000
+
+    for start in range(0, actual_flat.numel(), chunk_size):
+        end = min(
+            start + chunk_size,
+            actual_flat.numel(),
+        )
+
+        if not torch.allclose(
+            actual_flat[start:end],
+            expected_flat[start:end],
+            rtol=rtol,
+            atol=atol,
+        ):
+            return False
+
+    return True
+
+
 def main():
     candidate_file = sys.argv[1]
     problem_file = sys.argv[2]
@@ -34,14 +64,29 @@ def main():
             "kernelbench_problem",
         )
 
+        seed = 42
+
+        # Get constructor arguments
+        set_seed(seed)
+        init_inputs = problem.get_init_inputs()
+
         # Create reference PyTorch model
-        model = problem.Model(
-            *problem.get_init_inputs()
+        set_seed(seed)
+        reference_model = problem.Model(
+            *init_inputs
         ).cuda()
 
-        model.eval()
+        # Create generated Triton model
+        set_seed(seed)
+        candidate_model = candidate.ModelNew(
+            *init_inputs
+        ).cuda()
 
-        # Create KernelBench inputs
+        reference_model.eval()
+        candidate_model.eval()
+
+        # Create identical KernelBench inputs
+        set_seed(seed)
         inputs = problem.get_inputs()
 
         inputs = [
@@ -51,16 +96,26 @@ def main():
 
         # Run reference and candidate
         with torch.no_grad():
-            expected = model(*inputs)
-            actual = candidate.triton_implementation(*inputs)
+            expected = reference_model(*inputs)
+            actual = candidate_model(*inputs)
 
-        # Check correctness
-        torch.testing.assert_close(
+        # Check output shape
+        if expected.shape != actual.shape:
+            raise AssertionError(
+                f"Shape mismatch: expected {expected.shape}, "
+                f"got {actual.shape}"
+            )
+
+        # Compare outputs in chunks to avoid OOM on large tensors
+        if not tensors_allclose(
             actual,
             expected,
             rtol=1e-4,
             atol=1e-4,
-        )
+        ):
+            raise AssertionError(
+                "Output mismatch"
+            )
 
         print(json.dumps({
             "passed": True,

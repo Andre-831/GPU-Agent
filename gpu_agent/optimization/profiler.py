@@ -363,16 +363,22 @@ def create_candidate_workload(problem_file=None):
     if problem_file is None:
         code = """
 import torch
-from generated_kernel import triton_implementation
+from generated_kernel import ModelNew
+
+model = ModelNew().cuda()
+model.eval()
 
 x = torch.randn(10_000_000, device="cuda")
 
-for _ in range(5):
-    y = triton_implementation(x)
+with torch.no_grad():
+    for _ in range(5):
+        y = model(x)
 
 torch.cuda.synchronize()
 
-y = triton_implementation(x)
+with torch.no_grad():
+    y = model(x)
+
 torch.cuda.synchronize()
 """
 
@@ -381,7 +387,13 @@ torch.cuda.synchronize()
 import importlib.util
 import torch
 
-from generated_kernel import triton_implementation
+from generated_kernel import ModelNew
+
+
+def set_seed(seed):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
 
 spec = importlib.util.spec_from_file_location(
     "kernelbench_problem",
@@ -391,6 +403,16 @@ spec = importlib.util.spec_from_file_location(
 problem = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(problem)
 
+seed = 42
+
+set_seed(seed)
+init_inputs = problem.get_init_inputs()
+
+set_seed(seed)
+model = ModelNew(*init_inputs).cuda()
+model.eval()
+
+set_seed(seed)
 inputs = problem.get_inputs()
 
 inputs = [
@@ -398,12 +420,15 @@ inputs = [
     for x in inputs
 ]
 
-for _ in range(5):
-    y = triton_implementation(*inputs)
+with torch.no_grad():
+    for _ in range(5):
+        y = model(*inputs)
 
 torch.cuda.synchronize()
 
-y = triton_implementation(*inputs)
+with torch.no_grad():
+    y = model(*inputs)
+
 torch.cuda.synchronize()
 """
 

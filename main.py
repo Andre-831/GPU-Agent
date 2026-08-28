@@ -1,13 +1,15 @@
+import sys
+
 from gpu_agent.optimization.orchestrator import run_optimization
 
 
 def main():
-    problem_file = (
-        "external/KernelBench/KernelBench/level1/"
-        "47_Sum_reduction_over_a_dimension.py"
-    )
+    if len(sys.argv) != 2:
+        print("Usage: python main.py <kernelbench_problem.py>")
+        sys.exit(1)
 
-    # Give the generator the actual KernelBench problem source
+    problem_file = sys.argv[1]
+
     with open(problem_file, "r") as f:
         pytorch_code = f.read()
 

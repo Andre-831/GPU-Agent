@@ -1,13 +1,14 @@
-import os
 import json
+
 from openai import OpenAI
 
 from gpu_agent.prompts import TRITON_GENERATION_PROMPT
 
+
 client = OpenAI()
 
-def generate_triton_kernel(pytorch_code, gpu_specs):
 
+def generate_triton_kernel(pytorch_code, gpu_specs):
     prompt = TRITON_GENERATION_PROMPT.format(
         pytorch_code=pytorch_code,
         gpu_specs=json.dumps(gpu_specs, indent=2),
@@ -19,8 +20,6 @@ def generate_triton_kernel(pytorch_code, gpu_specs):
     )
 
     return response.output_text
-
-
 
 
 def extract_python_code(response):

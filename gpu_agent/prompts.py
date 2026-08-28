@@ -38,12 +38,11 @@ Requirements:
 """
 
 
-
 TRITON_GENERATION_PROMPT = """\
 You are an expert GPU performance engineer specializing in PyTorch and Triton.
 
 Your task is to replace the provided PyTorch computation with an optimized
-Triton implementation.
+Triton implementation compatible with the KernelBench model interface.
 
 ## Target GPU
 
@@ -58,16 +57,24 @@ Triton implementation.
 - Preserve the exact computation performed by the PyTorch reference.
 - Generate a Triton implementation optimized for the target GPU.
 - Include all required imports.
-- Include the @triton.jit kernel.
-- Include a Python wrapper named `triton_implementation`.
-- `triton_implementation` must preserve the same input/output interface as the PyTorch reference.
-- Do not use torch operations to perform the computation inside the replacement.
+- Include the required @triton.jit kernel or kernels.
+- Define a class named `ModelNew` that subclasses `torch.nn.Module`.
+- `ModelNew` must have the same constructor interface as the reference `Model`.
+- `ModelNew.forward()` must have the same input/output interface as the reference `Model.forward()`.
+- If the reference Model contains parameters or buffers, ModelNew must create
+  corresponding parameters or buffers so that deterministic initialization with
+  the same random seed produces equivalent model state.
+- ModelNew.forward() must execute the replacement Triton implementation.
+- You may define helper Python functions such as `triton_implementation` if useful,
+  but ModelNew is the required entry point.
+- Do not use torch operations to perform the core computation being replaced.
+- Torch may be used for tensor allocation, shape/stride inspection, parameters,
+  buffers, and other model/interface bookkeeping.
+- Do not hardcode outputs or exploit known input values.
 - Return Python code only.
 - Use minimal comments.
 - Do not include explanations, tests, or benchmarks.
 """
-
-
 
 TRITON_OPTIMIZATION_PROMPT = """\
 You are an expert GPU performance engineer specializing in Triton.
@@ -100,16 +107,29 @@ Headroom: {headroom:.2f}%
 {error}
 
 ## Task
-Generate an improved, valid Triton implementation.
+Generate an improved, valid Triton implementation compatible with the
+KernelBench model interface.
 
 If a previous compiler/runtime error is provided, fix that error before
 attempting further optimization.
 
 Requirements:
+- Preserve the exact computation performed by the PyTorch reference.
 - Preserve correctness.
 - Use only valid Triton APIs.
-- Wrapper MUST be named `triton_implementation`.
-- Preserve the same input/output interface.
+- Preserve a class named `ModelNew` that subclasses `torch.nn.Module`.
+- ModelNew must preserve the same constructor interface as the reference Model.
+- ModelNew.forward() must preserve the same input/output interface as the
+  reference Model.forward().
+- If the reference Model contains parameters or buffers, ModelNew must create
+  corresponding parameters or buffers so that deterministic initialization with
+  the same random seed produces equivalent model state.
+- ModelNew.forward() must execute the optimized Triton implementation.
+- You may define helper Python functions such as `triton_implementation` if useful.
+- Do not use torch operations to perform the core computation being replaced.
+- Torch may be used for tensor allocation, shape/stride inspection, parameters,
+  buffers, and other model/interface bookkeeping.
+- Do not hardcode outputs or exploit known input values.
 - Return Python code only.
 - Use minimal comments.
 """

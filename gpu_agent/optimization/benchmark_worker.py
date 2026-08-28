@@ -17,6 +17,11 @@ def load_module(filename, module_name):
     return module
 
 
+def set_seed(seed):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
 def main():
     candidate_file = sys.argv[1]
     problem_file = sys.argv[2]
@@ -34,14 +39,29 @@ def main():
             "kernelbench_problem",
         )
 
+        seed = 42
+
+        # Get constructor arguments
+        set_seed(seed)
+        init_inputs = problem.get_init_inputs()
+
         # Create reference PyTorch model
-        model = problem.Model(
-            *problem.get_init_inputs()
+        set_seed(seed)
+        reference_model = problem.Model(
+            *init_inputs
         ).cuda()
 
-        model.eval()
+        # Create generated Triton model
+        set_seed(seed)
+        candidate_model = candidate.ModelNew(
+            *init_inputs
+        ).cuda()
+
+        reference_model.eval()
+        candidate_model.eval()
 
         # Create KernelBench inputs
+        set_seed(seed)
         inputs = problem.get_inputs()
 
         inputs = [
@@ -52,8 +72,8 @@ def main():
         # Warmup
         with torch.no_grad():
             for _ in range(5):
-                model(*inputs)
-                candidate.triton_implementation(*inputs)
+                reference_model(*inputs)
+                candidate_model(*inputs)
 
         torch.cuda.synchronize()
 
@@ -66,7 +86,7 @@ def main():
 
         with torch.no_grad():
             for _ in range(20):
-                model(*inputs)
+                reference_model(*inputs)
 
         end.record()
 
@@ -78,8 +98,9 @@ def main():
 
         start.record()
 
-        for _ in range(20):
-            candidate.triton_implementation(*inputs)
+        with torch.no_grad():
+            for _ in range(20):
+                candidate_model(*inputs)
 
         end.record()
 
