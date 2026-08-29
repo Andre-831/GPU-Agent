@@ -26,8 +26,6 @@ def tensors_allclose(actual, expected, rtol=1e-4, atol=1e-4):
     actual_flat = actual.reshape(-1)
     expected_flat = expected.reshape(-1)
 
-    # Compare in chunks to avoid large temporary GPU allocations
-    # from torch.allclose on very large tensors.
     chunk_size = 10_000_000
 
     for start in range(0, actual_flat.numel(), chunk_size):
@@ -36,15 +34,42 @@ def tensors_allclose(actual, expected, rtol=1e-4, atol=1e-4):
             actual_flat.numel(),
         )
 
+        actual_chunk = actual_flat[start:end]
+        expected_chunk = expected_flat[start:end]
+
         if not torch.allclose(
-            actual_flat[start:end],
-            expected_flat[start:end],
+            actual_chunk,
+            expected_chunk,
             rtol=rtol,
             atol=atol,
         ):
-            return False
+            # Calculate diagnostics only for the failing chunk
+            # to avoid large full-tensor temporary allocations.
+            diff = torch.abs(
+                actual_chunk - expected_chunk
+            )
 
-    return True
+            max_diff = diff.max().item()
+            mean_diff = diff.mean().item()
+
+            # Find the element with the largest error.
+            local_index = diff.argmax().item()
+            global_index = start + local_index
+
+            actual_value = actual_chunk[local_index].item()
+            expected_value = expected_chunk[local_index].item()
+
+            return False, {
+                "chunk_start": start,
+                "chunk_end": end,
+                "index": global_index,
+                "actual": actual_value,
+                "expected": expected_value,
+                "max_abs_diff": max_diff,
+                "mean_abs_diff": mean_diff,
+            }
+
+    return True, None
 
 
 def main():
@@ -106,15 +131,28 @@ def main():
                 f"got {actual.shape}"
             )
 
-        # Compare outputs in chunks to avoid OOM on large tensors
-        if not tensors_allclose(
+        # Compare outputs in chunks to avoid OOM
+        close, diagnostics = tensors_allclose(
             actual,
             expected,
             rtol=1e-4,
             atol=1e-4,
-        ):
+        )
+
+        if not close:
             raise AssertionError(
-                "Output mismatch"
+                "Output mismatch. "
+                f"First failing chunk: "
+                f"{diagnostics['chunk_start']}:"
+                f"{diagnostics['chunk_end']}. "
+                f"Largest mismatch at flattened index "
+                f"{diagnostics['index']}. "
+                f"Expected {diagnostics['expected']}, "
+                f"got {diagnostics['actual']}. "
+                f"Max absolute difference: "
+                f"{diagnostics['max_abs_diff']}. "
+                f"Mean absolute difference in chunk: "
+                f"{diagnostics['mean_abs_diff']}."
             )
 
         print(json.dumps({

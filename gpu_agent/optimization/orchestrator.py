@@ -1,6 +1,7 @@
 from gpu_agent.generation.generator import (
     generate_triton_kernel,
     extract_python_code,
+    repair_triton_kernel,
 )
 from gpu_agent.generation.verifier import verify_candidate
 
@@ -15,11 +16,10 @@ from gpu_agent.optimization.optimizer import optimize_triton_kernel
 from gpu_agent.evaluation.evaluator import evaluate_kernel
 
 
-
 def run_optimization(pytorch_code, problem_file=None):
     gpu_specs = get_gpu_specs()
 
-
+    # Initial generation
     triton_code = generate_triton_kernel(
         pytorch_code,
         gpu_specs,
@@ -27,22 +27,38 @@ def run_optimization(pytorch_code, problem_file=None):
 
     triton_code = extract_python_code(triton_code)
 
-    with open("generated_kernel.py", "w") as f:
-        f.write(triton_code)
+    # Correctness refinement loop
+    max_refinement_rounds = 5
+    refinement_history = []
 
-    print("\n================ GENERATED TRITON ================")
-    print(triton_code)
+    for refinement_round in range(1, max_refinement_rounds + 1):
 
-    print("\nGenerated candidate saved to generated_kernel.py")
+        with open("generated_kernel.py", "w") as f:
+            f.write(triton_code)
 
+        print(
+            f"\n================ GENERATION ROUND "
+            f"{refinement_round} ================"
+        )
+        print(triton_code)
 
-    verification = verify_candidate( problem_file=problem_file)
+        print("\nGenerated candidate saved to generated_kernel.py")
 
-    print("\n================ VERIFICATION ================")
+        verification = verify_candidate(
+            problem_file=problem_file
+        )
 
-    if verification["passed"]:
-        print(f"PASS: {verification['tests']} tests passed")
-    else:
+        print(
+            f"\n================ VERIFICATION ROUND "
+            f"{refinement_round} ================"
+        )
+
+        if verification["passed"]:
+            print(
+                f"PASS: {verification['tests']} tests passed"
+            )
+            break
+
         print("FAIL")
         print(f"Type: {verification['error_type']}")
 
@@ -50,20 +66,48 @@ def run_optimization(pytorch_code, problem_file=None):
             print(f"Shape: {verification['shape']}")
 
         print(verification["error"])
-        return
 
+        # Record this failure before the next repair attempt.
+        history_entry = {
+            "round": refinement_round,
+            "error_type": verification["error_type"],
+            "error": verification["error"],
+        }
 
-    benchmark = benchmark_candidate(problem_file=problem_file)
+        if "shape" in verification:
+            history_entry["shape"] = verification["shape"]
+
+        refinement_history.append(history_entry)
+
+        if refinement_round == max_refinement_rounds:
+            print(
+                "\nFailed to generate a correct kernel after "
+                f"{max_refinement_rounds} refinement rounds."
+            )
+            return
+
+        print("\nGiving LLM a correction attempt...")
+
+        triton_code = repair_triton_kernel(
+            pytorch_code=pytorch_code,
+            triton_code=triton_code,
+            gpu_specs=gpu_specs,
+            error_type=verification["error_type"],
+            error=verification["error"],
+            refinement_history=refinement_history,
+        )
+
+    # Initial benchmark
+    benchmark = benchmark_candidate(
+        problem_file=problem_file
+    )
 
     print("\n================ BENCHMARK ================")
     print(f"PyTorch: {benchmark['pytorch_ms']:.4f} ms")
     print(f"Triton:  {benchmark['triton_ms']:.4f} ms")
     print(f"Speedup: {benchmark['speedup']:.2f}x")
 
-
-
-    # iterative loop optimization
-
+    # Iterative optimization loop
     best_code = triton_code
     best_benchmark = benchmark
     best_version = 1
@@ -76,7 +120,7 @@ def run_optimization(pytorch_code, problem_file=None):
             f"\n================ OPTIMIZATION V{iteration} ================"
         )
 
-        # save cur best as the kernel that will be profiled
+        # Save current best as the kernel that will be profiled
         with open("generated_kernel.py", "w") as f:
             f.write(best_code)
 
@@ -98,13 +142,28 @@ def run_optimization(pytorch_code, problem_file=None):
         candidate_roofline = analyze_roofline(candidate_metrics)
 
         print("\n================ CANDIDATE ROOFLINE ================")
-        print(f"Classification: {candidate_roofline['classification']}")
-        print(f"Compute SOL: {candidate_roofline['compute_sol']}%")
-        print(f"Memory SOL: {candidate_roofline['memory_sol']}%")
-        print(f"Efficiency: {candidate_roofline['efficiency']}%")
-        print(f"Headroom: {candidate_roofline['headroom']}%")
+        print(
+            f"Classification: "
+            f"{candidate_roofline['classification']}"
+        )
+        print(
+            f"Compute SOL: "
+            f"{candidate_roofline['compute_sol']}%"
+        )
+        print(
+            f"Memory SOL: "
+            f"{candidate_roofline['memory_sol']}%"
+        )
+        print(
+            f"Efficiency: "
+            f"{candidate_roofline['efficiency']}%"
+        )
+        print(
+            f"Headroom: "
+            f"{candidate_roofline['headroom']}%"
+        )
 
-        # generate an optimization of the cur best
+        # Generate an optimization of the current best
         candidate_code = optimize_triton_kernel(
             pytorch_code=pytorch_code,
             triton_code=best_code,
@@ -122,14 +181,19 @@ def run_optimization(pytorch_code, problem_file=None):
             f.write(candidate_code)
 
         print(
-            f"\n================ GENERATED TRITON V{iteration} ================"
+            f"\n================ GENERATED TRITON "
+            f"V{iteration} ================"
         )
         print(candidate_code)
 
-        verification = verify_candidate(candidate_file,problem_file=problem_file)
+        verification = verify_candidate(
+            candidate_file,
+            problem_file=problem_file,
+        )
 
         print(
-            f"\n================ V{iteration} VERIFICATION ================"
+            f"\n================ V{iteration} "
+            f"VERIFICATION ================"
         )
 
         if not verification["passed"]:
@@ -154,10 +218,14 @@ def run_optimization(pytorch_code, problem_file=None):
             with open(candidate_file, "w") as f:
                 f.write(candidate_code)
 
-            verification = verify_candidate(candidate_file, problem_file=problem_file)
+            verification = verify_candidate(
+                candidate_file,
+                problem_file=problem_file,
+            )
 
             print(
-                f"\n================ V{iteration} RETRY VERIFICATION ================"
+                f"\n================ V{iteration} "
+                f"RETRY VERIFICATION ================"
             )
 
             if not verification["passed"]:
@@ -166,22 +234,44 @@ def run_optimization(pytorch_code, problem_file=None):
                 print(f"V{iteration} rejected.")
                 continue
 
-        print(f"PASS: {verification['tests']} tests passed")
+        print(
+            f"PASS: {verification['tests']} tests passed"
+        )
 
-        candidate_benchmark = benchmark_candidate(candidate_file, problem_file=problem_file)
+        candidate_benchmark = benchmark_candidate(
+            candidate_file,
+            problem_file=problem_file,
+        )
 
         print(
-            f"\n================ V{iteration} BENCHMARK ================"
+            f"\n================ V{iteration} "
+            f"BENCHMARK ================"
         )
-        print(f"PyTorch:      {candidate_benchmark['pytorch_ms']:.4f} ms")
-        print(f"Current best: {best_benchmark['triton_ms']:.4f} ms")
-        print(f"Candidate:    {candidate_benchmark['triton_ms']:.4f} ms")
-        print(f"Speedup:      {candidate_benchmark['speedup']:.2f}x")
+        print(
+            f"PyTorch:      "
+            f"{candidate_benchmark['pytorch_ms']:.4f} ms"
+        )
+        print(
+            f"Current best: "
+            f"{best_benchmark['triton_ms']:.4f} ms"
+        )
+        print(
+            f"Candidate:    "
+            f"{candidate_benchmark['triton_ms']:.4f} ms"
+        )
+        print(
+            f"Speedup:      "
+            f"{candidate_benchmark['speedup']:.2f}x"
+        )
 
-        if candidate_benchmark["triton_ms"] < best_benchmark["triton_ms"]:
+        if (
+            candidate_benchmark["triton_ms"]
+            < best_benchmark["triton_ms"]
+        ):
 
             print(
-                f"\nV{iteration} ACCEPTED: faster than V{best_version}"
+                f"\nV{iteration} ACCEPTED: "
+                f"faster than V{best_version}"
             )
 
             best_code = candidate_code
@@ -190,7 +280,8 @@ def run_optimization(pytorch_code, problem_file=None):
 
         else:
             print(
-                f"\nV{iteration} REJECTED: V{best_version} remains faster"
+                f"\nV{iteration} REJECTED: "
+                f"V{best_version} remains faster"
             )
 
     with open("generated_kernel_best.py", "w") as f:
@@ -203,8 +294,7 @@ def run_optimization(pytorch_code, problem_file=None):
     print(f"Speedup: {best_benchmark['speedup']:.2f}x")
     print("Best kernel saved to generated_kernel_best.py")
 
-    # FINAL EVALUATION
-
+    # Final evaluation
     if problem_file is not None:
 
         print("\n================ FINAL EVALUATION ================")
@@ -222,11 +312,13 @@ def run_optimization(pytorch_code, problem_file=None):
             )
 
             print(
-                f"PyTorch: {final_evaluation['pytorch_ms']:.4f} ms"
+                f"PyTorch: "
+                f"{final_evaluation['pytorch_ms']:.4f} ms"
             )
 
             print(
-                f"Triton:  {final_evaluation['triton_ms']:.4f} ms"
+                f"Triton:  "
+                f"{final_evaluation['triton_ms']:.4f} ms"
             )
 
             print(
@@ -252,7 +344,6 @@ def run_optimization(pytorch_code, problem_file=None):
 
     else:
         final_evaluation = None
-
 
     return {
         "winner": f"v{best_version}",
