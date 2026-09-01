@@ -16,48 +16,63 @@ from gpu_agent.optimization.optimizer import optimize_triton_kernel
 from gpu_agent.evaluation.evaluator import evaluate_kernel
 
 
-def run_optimization(pytorch_code, problem_file=None):
-    gpu_specs = get_gpu_specs()
+def generate_verified_candidate(
+    pytorch_code,
+    gpu_specs,
+    problem_file,
+    candidate_id,
+    max_refinement_rounds=5,
+):
+    candidate_file = f"generated_kernel_seed_{candidate_id}.py"
 
-    # Initial generation
     triton_code = generate_triton_kernel(
         pytorch_code,
         gpu_specs,
     )
 
+    if triton_code is None:
+        return None
+
     triton_code = extract_python_code(triton_code)
 
-    # Correctness refinement loop
-    max_refinement_rounds = 5
+    if triton_code is None:
+        return None
+
     refinement_history = []
 
     for refinement_round in range(1, max_refinement_rounds + 1):
 
-        with open("generated_kernel.py", "w") as f:
+        with open(candidate_file, "w") as f:
             f.write(triton_code)
 
         print(
-            f"\n================ GENERATION ROUND "
-            f"{refinement_round} ================"
+            f"\n================ SEED {candidate_id} "
+            f"GENERATION ROUND {refinement_round} ================"
         )
         print(triton_code)
 
-        print("\nGenerated candidate saved to generated_kernel.py")
+        print(f"\nGenerated candidate saved to {candidate_file}")
 
         verification = verify_candidate(
-            problem_file=problem_file
+            candidate_file,
+            problem_file=problem_file,
         )
 
         print(
-            f"\n================ VERIFICATION ROUND "
-            f"{refinement_round} ================"
+            f"\n================ SEED {candidate_id} "
+            f"VERIFICATION ROUND {refinement_round} ================"
         )
 
         if verification["passed"]:
             print(
                 f"PASS: {verification['tests']} tests passed"
             )
-            break
+
+            return {
+                "id": candidate_id,
+                "code": triton_code,
+                "file": candidate_file,
+            }
 
         print("FAIL")
         print(f"Type: {verification['error_type']}")
@@ -67,7 +82,6 @@ def run_optimization(pytorch_code, problem_file=None):
 
         print(verification["error"])
 
-        # Record this failure before the next repair attempt.
         history_entry = {
             "round": refinement_round,
             "error_type": verification["error_type"],
@@ -81,10 +95,10 @@ def run_optimization(pytorch_code, problem_file=None):
 
         if refinement_round == max_refinement_rounds:
             print(
-                "\nFailed to generate a correct kernel after "
-                f"{max_refinement_rounds} refinement rounds."
+                f"\nSeed {candidate_id} failed to generate a correct "
+                f"kernel after {max_refinement_rounds} refinement rounds."
             )
-            return
+            return None
 
         print("\nGiving LLM a correction attempt...")
 
@@ -97,17 +111,102 @@ def run_optimization(pytorch_code, problem_file=None):
             refinement_history=refinement_history,
         )
 
-    # Initial benchmark
-    benchmark = benchmark_candidate(
-        problem_file=problem_file
+        if triton_code is None:
+            return None
+
+    return None
+
+
+def run_optimization(pytorch_code, problem_file=None):
+    gpu_specs = get_gpu_specs()
+
+    # Generate multiple independent starting candidates
+    num_seeds = 4
+    candidates = []
+
+    for candidate_id in range(1, num_seeds + 1):
+
+        print(
+            f"\n================ SEED "
+            f"{candidate_id}/{num_seeds} ================"
+        )
+
+        candidate = generate_verified_candidate(
+            pytorch_code=pytorch_code,
+            gpu_specs=gpu_specs,
+            problem_file=problem_file,
+            candidate_id=candidate_id,
+        )
+
+        if candidate is not None:
+            candidates.append(candidate)
+
+    if not candidates:
+        print("\nNo seed produced a correct kernel.")
+        return
+
+    print(
+        f"\n================ SEED RESULTS ================\n"
+        f"{len(candidates)}/{num_seeds} seeds produced correct kernels."
     )
 
-    print("\n================ BENCHMARK ================")
-    print(f"PyTorch: {benchmark['pytorch_ms']:.4f} ms")
-    print(f"Triton:  {benchmark['triton_ms']:.4f} ms")
-    print(f"Speedup: {benchmark['speedup']:.2f}x")
+    # Benchmark every correct seed and select the fastest
+    best_seed = None
+    best_seed_benchmark = None
 
-    # Iterative optimization loop
+    for candidate in candidates:
+
+        candidate_benchmark = benchmark_candidate(
+            candidate["file"],
+            problem_file=problem_file,
+        )
+
+        candidate["benchmark"] = candidate_benchmark
+
+        print(
+            f"\n================ SEED {candidate['id']} "
+            f"BENCHMARK ================"
+        )
+        print(
+            f"PyTorch: {candidate_benchmark['pytorch_ms']:.4f} ms"
+        )
+        print(
+            f"Triton:  {candidate_benchmark['triton_ms']:.4f} ms"
+        )
+        print(
+            f"Speedup: {candidate_benchmark['speedup']:.2f}x"
+        )
+
+        if (
+            best_seed_benchmark is None
+            or candidate_benchmark["triton_ms"]
+            < best_seed_benchmark["triton_ms"]
+        ):
+            best_seed = candidate
+            best_seed_benchmark = candidate_benchmark
+
+    print(
+        f"\n================ BEST SEED ================\n"
+        f"Winner: Seed {best_seed['id']}"
+    )
+    print(
+        f"PyTorch: {best_seed_benchmark['pytorch_ms']:.4f} ms"
+    )
+    print(
+        f"Triton:  {best_seed_benchmark['triton_ms']:.4f} ms"
+    )
+    print(
+        f"Speedup: {best_seed_benchmark['speedup']:.2f}x"
+    )
+
+    
+    triton_code = best_seed["code"]
+    benchmark = best_seed_benchmark
+
+    with open("generated_kernel.py", "w") as f:
+        f.write(triton_code)
+
+    
     best_code = triton_code
     best_benchmark = benchmark
     best_version = 1
@@ -124,7 +223,7 @@ def run_optimization(pytorch_code, problem_file=None):
         with open("generated_kernel.py", "w") as f:
             f.write(best_code)
 
-        # Profile current best
+        
         create_candidate_workload(problem_file=problem_file)
         candidate_profile = profile_candidate()
 
@@ -163,7 +262,7 @@ def run_optimization(pytorch_code, problem_file=None):
             f"{candidate_roofline['headroom']}%"
         )
 
-        # Generate an optimization of the current best
+        
         candidate_code = optimize_triton_kernel(
             pytorch_code=pytorch_code,
             triton_code=best_code,
@@ -347,6 +446,7 @@ def run_optimization(pytorch_code, problem_file=None):
 
     return {
         "winner": f"v{best_version}",
+        "seed": best_seed["id"],
         "code": best_code,
         "benchmark": best_benchmark,
         "evaluation": final_evaluation,
