@@ -77,19 +77,14 @@ def generate_verified_candidate(
         print("FAIL")
         print(f"Type: {verification['error_type']}")
 
-        if "shape" in verification:
-            print(f"Shape: {verification['shape']}")
-
         print(verification["error"])
 
         history_entry = {
             "round": refinement_round,
+            "kernel_code": triton_code,
             "error_type": verification["error_type"],
             "error": verification["error"],
         }
-
-        if "shape" in verification:
-            history_entry["shape"] = verification["shape"]
 
         refinement_history.append(history_entry)
 
