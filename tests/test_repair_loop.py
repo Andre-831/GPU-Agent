@@ -1,8 +1,3 @@
-import os
-
-
-os.environ.setdefault("OPENAI_API_KEY", "test-api-key")
-
 from gpu_agent.optimization import orchestrator
 
 
@@ -22,11 +17,20 @@ def test_failed_first_attempt_proceeds_to_repair(monkeypatch, tmp_path):
     ])
     repair_calls = []
 
+    class FakeClient:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    client = FakeClient()
+
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(orchestrator, "create_openai_client", lambda: client)
     monkeypatch.setattr(
         orchestrator,
         "generate_triton_kernel",
-        lambda pytorch_code, gpu_specs: initial_code,
+        lambda pytorch_code, gpu_specs, client: initial_code,
     )
     monkeypatch.setattr(
         orchestrator,
@@ -66,3 +70,4 @@ def test_failed_first_attempt_proceeds_to_repair(monkeypatch, tmp_path):
         "file": "generated_kernel_seed_1.py",
     }
     assert (tmp_path / "generated_kernel_seed_1.py").read_text() == repaired_code
+    assert client.closed

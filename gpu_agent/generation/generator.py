@@ -9,10 +9,14 @@ from gpu_agent.prompts import (
 )
 
 
-client = OpenAI()
+def create_openai_client():
+    return OpenAI()
 
 
-def generate_triton_kernel(pytorch_code, gpu_specs):
+def generate_triton_kernel(pytorch_code, gpu_specs, client=None):
+    if client is None:
+        client = create_openai_client()
+
     prompt = TRITON_GENERATION_PROMPT.format(
         pytorch_code=pytorch_code,
         gpu_specs=json.dumps(gpu_specs, indent=2),
@@ -72,7 +76,11 @@ def repair_triton_kernel(
     error_type,
     error,
     refinement_history,
+    client=None,
 ):
+    if client is None:
+        client = create_openai_client()
+
     prompt = TRITON_REPAIR_PROMPT.format(
         triton_guidelines=TRITON_GUIDELINES,
         pytorch_code=pytorch_code,

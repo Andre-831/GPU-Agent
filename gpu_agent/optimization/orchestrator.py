@@ -1,4 +1,9 @@
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+import traceback
+
 from gpu_agent.generation.generator import (
+    create_openai_client,
     generate_triton_kernel,
     extract_python_code,
     repair_triton_kernel,
@@ -16,6 +21,9 @@ from gpu_agent.optimization.optimizer import optimize_triton_kernel
 from gpu_agent.evaluation.evaluator import evaluate_kernel
 
 
+_verification_semaphore = threading.Semaphore(1)
+
+
 def generate_verified_candidate(
     pytorch_code,
     gpu_specs,
@@ -23,11 +31,35 @@ def generate_verified_candidate(
     candidate_id,
     max_refinement_rounds=5,
 ):
+    client = create_openai_client()
+
+    try:
+        return _generate_verified_candidate_with_client(
+            pytorch_code=pytorch_code,
+            gpu_specs=gpu_specs,
+            problem_file=problem_file,
+            candidate_id=candidate_id,
+            max_refinement_rounds=max_refinement_rounds,
+            client=client,
+        )
+    finally:
+        client.close()
+
+
+def _generate_verified_candidate_with_client(
+    pytorch_code,
+    gpu_specs,
+    problem_file,
+    candidate_id,
+    max_refinement_rounds,
+    client,
+):
     candidate_file = f"generated_kernel_seed_{candidate_id}.py"
 
     triton_code = generate_triton_kernel(
         pytorch_code,
         gpu_specs,
+        client=client,
     )
 
     if triton_code is None:
@@ -53,10 +85,11 @@ def generate_verified_candidate(
 
         print(f"\nGenerated candidate saved to {candidate_file}")
 
-        verification = verify_candidate(
-            candidate_file,
-            problem_file=problem_file,
-        )
+        with _verification_semaphore:
+            verification = verify_candidate(
+                candidate_file,
+                problem_file=problem_file,
+            )
 
         print(
             f"\n================ SEED {candidate_id} "
@@ -104,6 +137,7 @@ def generate_verified_candidate(
             error_type=verification["error_type"],
             error=verification["error"],
             refinement_history=refinement_history,
+            client=client,
         )
 
         if triton_code is None:
@@ -112,29 +146,67 @@ def generate_verified_candidate(
     return None
 
 
+def generate_seed_candidates(
+    pytorch_code,
+    gpu_specs,
+    problem_file,
+    num_seeds=4,
+):
+    candidates_by_id = {}
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {
+            executor.submit(
+                generate_verified_candidate,
+                pytorch_code=pytorch_code,
+                gpu_specs=gpu_specs,
+                problem_file=problem_file,
+                candidate_id=candidate_id,
+            ): candidate_id
+            for candidate_id in range(1, num_seeds + 1)
+        }
+
+        for future in as_completed(futures):
+            candidate_id = futures[future]
+
+            try:
+                candidate = future.result()
+            except Exception as error:
+                print(f"\nSeed {candidate_id} failed with an exception: {error}")
+                traceback.print_exception(
+                    type(error),
+                    error,
+                    error.__traceback__,
+                )
+                continue
+
+            if candidate is not None:
+                candidates_by_id[candidate_id] = candidate
+
+    return [
+        candidates_by_id[candidate_id]
+        for candidate_id in sorted(candidates_by_id)
+    ]
+
+
 def run_optimization(pytorch_code, problem_file=None):
     gpu_specs = get_gpu_specs()
 
     # Generate multiple independent starting candidates
     num_seeds = 4
-    candidates = []
 
     for candidate_id in range(1, num_seeds + 1):
-
         print(
             f"\n================ SEED "
             f"{candidate_id}/{num_seeds} ================"
         )
 
-        candidate = generate_verified_candidate(
-            pytorch_code=pytorch_code,
-            gpu_specs=gpu_specs,
-            problem_file=problem_file,
-            candidate_id=candidate_id,
-        )
-
-        if candidate is not None:
-            candidates.append(candidate)
+    candidates = generate_seed_candidates(
+        pytorch_code=pytorch_code,
+        gpu_specs=gpu_specs,
+        problem_file=problem_file,
+        num_seeds=num_seeds,
+    )
 
     if not candidates:
         print("\nNo seed produced a correct kernel.")
