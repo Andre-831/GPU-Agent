@@ -4,6 +4,8 @@ import sys
 
 import torch
 
+from gpu_agent.optimization.benchmark import benchmark_functions
+
 
 def load_module(filename, module_name):
     spec = importlib.util.spec_from_file_location(
@@ -27,6 +29,8 @@ def main():
     problem_file = sys.argv[2]
 
     try:
+        warmup_count = int(sys.argv[3]) if len(sys.argv) > 3 else 10
+        sample_count = int(sys.argv[4]) if len(sys.argv) > 4 else 30
         # Load generated Triton candidate
         candidate = load_module(
             candidate_file,
@@ -69,50 +73,13 @@ def main():
             for x in inputs
         ]
 
-        # Warmup
-        with torch.no_grad():
-            for _ in range(5):
-                reference_model(*inputs)
-                candidate_model(*inputs)
-
-        torch.cuda.synchronize()
-
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-
-        # ---------------- PyTorch ----------------
-
-        start.record()
-
-        with torch.no_grad():
-            for _ in range(20):
-                reference_model(*inputs)
-
-        end.record()
-
-        torch.cuda.synchronize()
-
-        pytorch_ms = start.elapsed_time(end) / 20
-
-        # ---------------- Triton ----------------
-
-        start.record()
-
-        with torch.no_grad():
-            for _ in range(20):
-                candidate_model(*inputs)
-
-        end.record()
-
-        torch.cuda.synchronize()
-
-        triton_ms = start.elapsed_time(end) / 20
-
-        print(json.dumps({
-            "pytorch_ms": pytorch_ms,
-            "triton_ms": triton_ms,
-            "speedup": pytorch_ms / triton_ms,
-        }))
+        result = benchmark_functions(
+            lambda: reference_model(*inputs),
+            lambda: candidate_model(*inputs),
+            warmup_count=warmup_count,
+            sample_count=sample_count,
+        )
+        print(json.dumps(result))
 
     except Exception as e:
         print(json.dumps({
