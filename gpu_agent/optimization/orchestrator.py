@@ -223,6 +223,7 @@ def run_optimization(pytorch_code, problem_file=None):
 
     for candidate in candidates:
 
+        print(f"Benchmarking Seed {candidate['id']}...", flush=True)
         candidate_benchmark = benchmark_candidate(
             candidate["file"],
             problem_file=problem_file,
@@ -404,6 +405,7 @@ def run_optimization(pytorch_code, problem_file=None):
             f"PASS: {verification['tests']} tests passed"
         )
 
+        print(f"Benchmarking optimization candidate V{iteration}...", flush=True)
         candidate_benchmark = benchmark_candidate(
             candidate_file,
             problem_file=problem_file,

@@ -1,10 +1,13 @@
+from contextlib import redirect_stdout
 import importlib.util
 import json
 import sys
 
 import torch
 
-from gpu_agent.optimization.benchmark import benchmark_functions
+from gpu_agent.optimization.benchmark import (
+    benchmark_functions, benchmark_progress, validate_budgets,
+)
 
 
 def load_module(filename, module_name):
@@ -29,56 +32,60 @@ def main():
     problem_file = sys.argv[2]
 
     try:
-        warmup_count = int(sys.argv[3]) if len(sys.argv) > 3 else 10
-        sample_count = int(sys.argv[4]) if len(sys.argv) > 4 else 30
-        # Load generated Triton candidate
-        candidate = load_module(
-            candidate_file,
-            "candidate_kernel",
-        )
+        warmup_ms = float(sys.argv[3]) if len(sys.argv) > 3 else 25
+        rep_ms = float(sys.argv[4]) if len(sys.argv) > 4 else 100
+        validate_budgets(warmup_ms, rep_ms)
+        benchmark_progress("Setup: loading models and preparing CUDA inputs...")
+        # Keep model/import prints off the JSON result channel as well.
+        with redirect_stdout(sys.stderr):
+            # Load generated Triton candidate
+            candidate = load_module(
+                candidate_file,
+                "candidate_kernel",
+            )
 
-        # Load KernelBench problem
-        problem = load_module(
-            problem_file,
-            "kernelbench_problem",
-        )
+            # Load KernelBench problem
+            problem = load_module(
+                problem_file,
+                "kernelbench_problem",
+            )
 
-        seed = 42
+            seed = 42
 
-        # Get constructor arguments
-        set_seed(seed)
-        init_inputs = problem.get_init_inputs()
+            # Get constructor arguments
+            set_seed(seed)
+            init_inputs = problem.get_init_inputs()
 
-        # Create reference PyTorch model
-        set_seed(seed)
-        reference_model = problem.Model(
-            *init_inputs
-        ).cuda()
+            # Create reference PyTorch model
+            set_seed(seed)
+            reference_model = problem.Model(
+                *init_inputs
+            ).cuda()
 
-        # Create generated Triton model
-        set_seed(seed)
-        candidate_model = candidate.ModelNew(
-            *init_inputs
-        ).cuda()
+            # Create generated Triton model
+            set_seed(seed)
+            candidate_model = candidate.ModelNew(
+                *init_inputs
+            ).cuda()
 
-        reference_model.eval()
-        candidate_model.eval()
+            reference_model.eval()
+            candidate_model.eval()
 
-        # Create KernelBench inputs
-        set_seed(seed)
-        inputs = problem.get_inputs()
+            # Create KernelBench inputs
+            set_seed(seed)
+            inputs = problem.get_inputs()
 
-        inputs = [
-            x.cuda() if isinstance(x, torch.Tensor) else x
-            for x in inputs
-        ]
+            inputs = [
+                x.cuda() if isinstance(x, torch.Tensor) else x
+                for x in inputs
+            ]
 
-        result = benchmark_functions(
-            lambda: reference_model(*inputs),
-            lambda: candidate_model(*inputs),
-            warmup_count=warmup_count,
-            sample_count=sample_count,
-        )
+            result = benchmark_functions(
+                lambda: reference_model(*inputs),
+                lambda: candidate_model(*inputs),
+                warmup_ms=warmup_ms,
+                rep_ms=rep_ms,
+            )
         print(json.dumps(result))
 
     except Exception as e:

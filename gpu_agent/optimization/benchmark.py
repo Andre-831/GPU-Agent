@@ -1,9 +1,12 @@
 import importlib.util
 import json
+import math
 import statistics
 import subprocess
+import sys
 
 import torch
+from triton.testing import do_bench
 
 
 def load_module(filename, module_name):
@@ -31,37 +34,46 @@ def timing_statistics(samples_ms):
     }
 
 
-def validate_counts(warmup_count, sample_count):
-    for name, value, minimum in (
-        ("warmup_count", warmup_count, 0),
-        ("sample_count", sample_count, 1),
+def validate_budgets(warmup_ms, rep_ms):
+    for name, value, allow_zero in (
+        ("warmup_ms", warmup_ms, True),
+        ("rep_ms", rep_ms, False),
     ):
-        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
-            raise ValueError(f"{name} must be an integer >= {minimum}")
+        validate_duration(name, value, allow_zero=allow_zero)
 
 
-def benchmark_functions(pytorch_call, triton_call, warmup_count=10, sample_count=30):
-    """Warm both implementations, then time separate batches of 20 calls."""
-    validate_counts(warmup_count, sample_count)
+def validate_duration(name, value, allow_zero=False):
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(value) or value < 0
+            or (value == 0 and not allow_zero)):
+        relation = ">= 0" if allow_zero else "> 0"
+        raise ValueError(f"{name} must be a finite number {relation}")
+
+
+def benchmark_progress(message):
+    print(f"[Benchmark] {message}", file=sys.stderr, flush=True)
+
+
+def benchmark_functions(pytorch_call, triton_call, warmup_ms=25, rep_ms=100):
+    """Collect adaptive per-call samples using approximate millisecond budgets.
+
+    Triton performs initial/calibration calls in addition to these budgets.
+    A single sample's zero stddev does not establish measurement certainty.
+    """
+    validate_budgets(warmup_ms, rep_ms)
     with torch.no_grad():
-        for _ in range(warmup_count):
-            pytorch_call()
-            triton_call()
-        torch.cuda.synchronize()
-
         timings = {}
-        for name, call in (("pytorch", pytorch_call), ("triton", triton_call)):
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            samples = []
-            for _ in range(sample_count):
-                start.record()
-                for _ in range(20):
-                    call()
-                end.record()
-                torch.cuda.synchronize()
-                samples.append(start.elapsed_time(end) / 20)
+        for name, label, call in (
+            ("pytorch", "PyTorch", pytorch_call),
+            ("triton", "Triton", triton_call),
+        ):
+            benchmark_progress(
+                f"{label} timing (warmup={warmup_ms} ms, measurement={rep_ms} ms)..."
+            )
+            samples = do_bench(call, warmup=warmup_ms, rep=rep_ms, return_mode="all")
             timings[f"{name}_stats"] = timing_statistics(samples)
+            benchmark_progress(f"{label} timing finished ({len(samples)} samples).")
+        benchmark_progress("Timing complete.")
 
     pytorch_ms = timings["pytorch_stats"]["median_ms"]
     triton_ms = timings["triton_stats"]["median_ms"]
@@ -87,10 +99,18 @@ def print_timing_summary(result):
 def benchmark_candidate(
     filename="generated_kernel.py",
     problem_file=None,
-    warmup_count=10,
-    sample_count=30,
+    warmup_ms=25,
+    rep_ms=100,
+    timeout_s=300,
 ):
-    validate_counts(warmup_count, sample_count)
+    """Benchmark with millisecond budgets and a worker wall-clock timeout.
+
+    Worker stdout is JSON; stderr is inherited for live diagnostics. A timeout
+    kills/reaps the worker and raises RuntimeError. The legacy ReLU path runs
+    in-process, so timeout_s only applies when problem_file is provided.
+    """
+    validate_budgets(warmup_ms, rep_ms)
+    validate_duration("timeout_s", timeout_s)
     # ============================================================
     # KERNELBENCH
     # Run benchmark in its own process so GPU memory is released
@@ -98,25 +118,31 @@ def benchmark_candidate(
     # ============================================================
 
     if problem_file is not None:
-        result = subprocess.run(
-            [
-                "python",
-                "-m",
-                "gpu_agent.optimization.benchmark_worker",
-                filename,
-                problem_file,
-                str(warmup_count),
-                str(sample_count),
-            ],
-            capture_output=True,
-            text=True,
-        )
+        benchmark_progress(f"Setup: starting worker for {filename} (timeout={timeout_s} s)...")
+        try:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "gpu_agent.optimization.benchmark_worker",
+                    filename,
+                    problem_file,
+                    str(warmup_ms),
+                    str(rep_ms),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=None,  # Inherit stderr so progress is visible immediately.
+                text=True,
+                timeout=timeout_s,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError(
+                f"Benchmark worker timed out after {timeout_s} seconds for {filename}"
+            ) from error
 
         if result.returncode != 0:
             raise RuntimeError(
                 "Benchmark worker failed:\n"
-                + result.stderr
-                + "\n"
                 + result.stdout
             )
 
@@ -132,7 +158,8 @@ def benchmark_candidate(
         print_timing_summary(benchmark)
         return benchmark
 
-    # OLD RELU TEST
+    # OLD RELU TEST (in-process; subprocess timeout does not apply)
+    benchmark_progress("Setup: loading ReLU benchmark...")
     candidate = load_module(
         filename,
         "candidate_kernel",
@@ -146,8 +173,8 @@ def benchmark_candidate(
     benchmark = benchmark_functions(
         lambda: torch.relu(x),
         lambda: candidate.triton_implementation(x),
-        warmup_count=warmup_count,
-        sample_count=sample_count,
+        warmup_ms=warmup_ms,
+        rep_ms=rep_ms,
     )
     print_timing_summary(benchmark)
     return benchmark
