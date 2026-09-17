@@ -19,7 +19,7 @@ Benchmark Verified Seeds Sequentially
       ↓
 Select Fastest Seed
       ↓
-Nsys + NCU Profiling
+Nsys + NCU Profiling of Current Best Kernel
       ↓
 Roofline Analysis
       ↓
@@ -53,6 +53,8 @@ GPU-Agent currently supports:
 - Isolated seed failures and deterministic candidate ordering
 - Verification subprocess timeouts
 - Candidate benchmarking and fastest-seed selection
+- Adaptive `triton.testing.do_bench` timing with raw samples and statistics
+- Benchmark progress reporting and subprocess timeouts
 - **NVIDIA Nsight Systems (Nsys)** profiling
 - **NVIDIA Nsight Compute (NCU)** hardware metrics
 - Roofline bottleneck analysis
@@ -98,6 +100,15 @@ Run GPU-Agent on a KernelBench problem:
 python main.py external/KernelBench/KernelBench/level1/19_ReLU.py
 ```
 
+Adjust the problem path to your KernelBench checkout. For the current Colab layout:
+
+```bash
+cd /content/GPU-Agent
+python main.py /content/KernelBench/KernelBench/level1/19_ReLU.py
+```
+
+Replace the problem filename to test another workload. Run problems sequentially; generated kernel and profiling files use shared filenames and are overwritten by later runs. Copy any results you want to keep before starting another problem.
+
 The agent will generate multiple Triton implementations, verify and benchmark them, select the fastest valid seed, profile it, and iteratively attempt to improve its performance.
 
 The best correctness-verified kernel found during the run is saved to:
@@ -114,12 +125,26 @@ For each optimization round, GPU-Agent:
 2. Collects Nsys and NCU performance metrics.
 3. Performs Roofline analysis.
 4. Sends the kernel and performance diagnostics to the LLM.
-5. Generates an optimized Triton implementation.
-6. Verifies the candidate for correctness.
-7. Benchmarks the candidate against the current best.
-8. Accepts the candidate only if it is correct and faster.
+5. Generates, saves, and prints an optimized Triton implementation.
+6. Verifies the candidate for correctness, allowing one correction attempt if verification fails.
+7. Benchmarks the verified candidate and compares its median latency with the stored current-best measurement.
+8. Accepts the candidate only if verification passed and its median latency is lower; otherwise retains the current best.
 
 This allows the system to use measured GPU behavior rather than relying solely on the LLM's assumptions about kernel performance.
+
+The winning seed is labeled **V1**. Up to five optimization rounds generate **V2–V6**. After optimization, the best kernel is saved and then undergoes final multi-trial correctness and performance evaluation. A final evaluation failure is reported; saving the file does not imply that this final check passed.
+
+### Reading the logs
+
+`OPTIMIZATION V4` marks the start of round V4, before V4 has been generated. If V3 was rejected and V2 remains the best kernel, the profiling output beneath that heading describes **V2**. The agent uses those measurements to generate V4, prints its code under `GENERATED TRITON V4`, verifies it, and only then benchmarks it under `V4 BENCHMARK`.
+
+### Benchmarking and selection
+
+Each initial benchmark times PyTorch first, then the Triton candidate, using approximately **25 ms warmup** and **100 ms measurement** per implementation. `do_bench` adapts the sample count to runtime, so slower workloads can return only a few samples. These budgets exclude some setup and calibration overhead and are not wall-clock limits.
+
+Results include raw timings, median, mean, standard deviation, minimum, maximum, and sample count. Selection uses the Triton median; reported speedup is the PyTorch median divided by the Triton median. KernelBench benchmark workers have a default **300-second subprocess timeout** and print live progress.
+
+**Current limitation:** both seed selection and optimization accept any strictly lower median. The collected spread statistics do not yet affect selection, and the incumbent is not freshly remeasured against each challenger. Tiny differences can therefore reflect measurement noise. Robust paired comparison remains planned, not implemented.
 
 ## Evaluation
 
@@ -137,9 +162,8 @@ Current development is focused on **KernelBench Level 1** workloads before expan
 
 ## What's Next
 
-## What's Next
-
-- Robust benchmarking and kernel selection
+- Test the current pipeline on more KernelBench Level 1 problems
+- Robust incumbent/challenger comparison with fresh paired measurements, alternating order, and bounded remeasurement
 - Full KernelBench Level 1 evaluation
 - Better optimization search and refinement
 - Arbitrary PyTorch workload support
