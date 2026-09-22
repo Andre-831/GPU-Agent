@@ -68,6 +68,7 @@ def test_failed_first_attempt_proceeds_to_repair(monkeypatch, tmp_path):
         "id": 1,
         "code": repaired_code,
         "file": "generated_kernel_seed_1.py",
+        "refinement_history": repair_calls[0]["refinement_history"],
     }
     assert (tmp_path / "generated_kernel_seed_1.py").read_text() == repaired_code
     assert client.closed

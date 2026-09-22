@@ -6,6 +6,7 @@ from gpu_agent.prompts import (
     TRITON_GENERATION_PROMPT,
     TRITON_REPAIR_PROMPT,
     TRITON_GUIDELINES,
+    TRITON_PRECISION_GUIDANCE,
 )
 
 
@@ -18,6 +19,7 @@ def generate_triton_kernel(pytorch_code, gpu_specs, client=None):
         client = create_openai_client()
 
     prompt = TRITON_GENERATION_PROMPT.format(
+        precision_guidance=TRITON_PRECISION_GUIDANCE,
         pytorch_code=pytorch_code,
         gpu_specs=json.dumps(gpu_specs, indent=2),
     )
@@ -61,6 +63,14 @@ def format_refinement_history(refinement_history):
             f"Error: {attempt['error']}",
         ]
 
+        # Precision settings may occur beyond the abbreviated kernel snippet.
+        precision_lines = [
+            line for line in attempt["kernel_code"].splitlines()
+            if "tl.dot" in line or "input_precision" in line
+        ]
+        if precision_lines:
+            entry.extend(["Dot/input precision lines:", "\n".join(precision_lines)])
+
         if "shape" in attempt:
             entry.append(f"Shape: {attempt['shape']}")
 
@@ -82,6 +92,7 @@ def repair_triton_kernel(
         client = create_openai_client()
 
     prompt = TRITON_REPAIR_PROMPT.format(
+        precision_guidance=TRITON_PRECISION_GUIDANCE,
         triton_guidelines=TRITON_GUIDELINES,
         pytorch_code=pytorch_code,
         triton_code=triton_code,

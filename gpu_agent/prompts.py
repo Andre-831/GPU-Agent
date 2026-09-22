@@ -1,3 +1,20 @@
+TRITON_PRECISION_GUIDANCE = """\
+## Triton Dot Precision and Correctness
+
+- Preserve the reference workload's numerical semantics, including input and
+  accumulation precision. Do not assume TF32 is acceptable for FP32 inputs.
+- tl.dot(..., input_precision="tf32") can improve FP32 GEMM performance, but
+  changes numerical behavior and may fail strict correctness tolerances.
+  FP32 accumulation alone does not restore precision lost in dot inputs.
+- Choose dot/input precision deliberately. input_precision="ieee" avoids TF32
+  input rounding but can significantly reduce GEMM performance; it is not a
+  substitute for verification. Use verification results to decide whether
+  lower-precision dot modes are valid for this workload.
+- No candidate can be accepted unless it passes verification. Never relax
+  correctness tolerances or change the reference to accommodate a precision mode.
+"""
+
+
 BOTTLENECK_PROMPT = """\
 You are a GPU performance expert analyzing GPU kernel profiling data.
 
@@ -43,6 +60,8 @@ You are an expert GPU performance engineer specializing in PyTorch and Triton.
 
 Your task is to replace the provided PyTorch computation with an optimized
 Triton implementation compatible with the KernelBench model interface.
+
+{precision_guidance}
 
 ## Target GPU
 
@@ -104,6 +123,11 @@ Headroom: {headroom:.2f}%
 ## NCU Metrics
 {ncu_metrics}
 
+{precision_guidance}
+
+## Previous Verification Failures
+{refinement_history}
+
 ## Previous Failure
 {error}
 
@@ -111,8 +135,14 @@ Headroom: {headroom:.2f}%
 Generate an improved, valid Triton implementation compatible with the
 KernelBench model interface.
 
-If a previous compiler/runtime error is provided, fix that error before
-attempting further optimization.
+If a previous verification error is provided, fix that error before
+attempting further optimization. For a small numerical mismatch involving
+tl.dot, consider dot/input precision as a likely cause before larger structural
+changes.
+
+Do not propose TF32 merely for speed when previous verification history shows
+that it violates correctness. Learn from failed precision modes and retain a
+verified precision choice while optimizing other aspects of the kernel.
 
 Requirements:
 - Preserve the exact computation performed by the PyTorch reference.
@@ -138,6 +168,8 @@ Requirements:
 TRITON_REPAIR_PROMPT = """\
 {triton_guidelines}
 
+{precision_guidance}
+
 ## Task
 
 Repair the following Triton implementation based on the verification results.
@@ -162,6 +194,9 @@ Error: {error}
 ## Requirements
 
 - Analyze the verification failure and make a targeted repair.
+- For a small numerical mismatch involving tl.dot, explicitly consider dot/input
+  precision as a likely cause before making larger structural changes. Check
+  whether TF32 input rounding explains the error and verify any precision change.
 - Preserve the exact computation performed by the PyTorch reference.
 - Learn from previous attempts and do not repeat approaches that clearly regressed or failed.
 - Follow the Triton programming guidelines above.

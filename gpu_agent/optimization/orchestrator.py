@@ -105,6 +105,7 @@ def _generate_verified_candidate_with_client(
                 "id": candidate_id,
                 "code": triton_code,
                 "file": candidate_file,
+                "refinement_history": refinement_history,
             }
 
         print("FAIL")
@@ -270,6 +271,7 @@ def run_optimization(pytorch_code, problem_file=None):
     
     triton_code = best_seed["code"]
     benchmark = best_seed_benchmark
+    refinement_history = list(best_seed.get("refinement_history", []))
 
     with open("generated_kernel.py", "w") as f:
         f.write(triton_code)
@@ -338,6 +340,7 @@ def run_optimization(pytorch_code, problem_file=None):
             benchmark=best_benchmark,
             ncu_metrics=candidate_metrics,
             roofline=candidate_roofline,
+            refinement_history=refinement_history,
         )
 
         candidate_code = extract_python_code(candidate_code)
@@ -368,6 +371,13 @@ def run_optimization(pytorch_code, problem_file=None):
             print(f"Type: {verification['error_type']}")
             print(verification["error"])
 
+            refinement_history.append({
+                "round": f"optimization V{iteration}",
+                "kernel_code": candidate_code,
+                "error_type": verification["error_type"],
+                "error": verification["error"],
+            })
+
             print("\nGiving LLM one correction attempt...")
 
             candidate_code = optimize_triton_kernel(
@@ -378,6 +388,7 @@ def run_optimization(pytorch_code, problem_file=None):
                 ncu_metrics=candidate_metrics,
                 roofline=candidate_roofline,
                 error=verification["error"],
+                refinement_history=refinement_history,
             )
 
             candidate_code = extract_python_code(candidate_code)
@@ -398,6 +409,12 @@ def run_optimization(pytorch_code, problem_file=None):
             if not verification["passed"]:
                 print("FAIL")
                 print(verification["error"])
+                refinement_history.append({
+                    "round": f"optimization V{iteration} retry",
+                    "kernel_code": candidate_code,
+                    "error_type": verification["error_type"],
+                    "error": verification["error"],
+                })
                 print(f"V{iteration} rejected.")
                 continue
 

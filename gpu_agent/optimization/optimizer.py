@@ -2,14 +2,16 @@ import os
 import json
 from openai import OpenAI
 
-from gpu_agent.prompts import TRITON_OPTIMIZATION_PROMPT
-from gpu_agent.generation.generator import extract_python_code
+from gpu_agent.prompts import TRITON_OPTIMIZATION_PROMPT, TRITON_PRECISION_GUIDANCE
+from gpu_agent.generation.generator import extract_python_code, format_refinement_history
 
 client = OpenAI()
 
-def optimize_triton_kernel(pytorch_code, triton_code, gpu_specs, benchmark, ncu_metrics, roofline,error=None):
+def optimize_triton_kernel(pytorch_code, triton_code, gpu_specs, benchmark, ncu_metrics, roofline, error=None, refinement_history=None):
 
     prompt = TRITON_OPTIMIZATION_PROMPT.format(
+        precision_guidance=TRITON_PRECISION_GUIDANCE,
+        refinement_history=format_refinement_history(refinement_history),
         gpu_specs=json.dumps(gpu_specs, indent=2),
         pytorch_code=pytorch_code,
         triton_code=triton_code,
